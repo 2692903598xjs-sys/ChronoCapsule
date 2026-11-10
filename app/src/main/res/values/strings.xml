@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">ChronoCapsule</string>
+    <string name="accessibility_label">ChronoCapsule 自动记录</string>
+    <string name="accessibility_description">切换到微信或 QQ 时自动截取一屏，在本机完成文字识别与结构化后，把结果上传到你的云端 Agent。截图不会保存在本机相册，也无法读取银行、支付等受保护界面。</string>
+</resources>

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    canTakeScreenshot="true"：Android 11+ 的 AccessibilityService.takeScreenshot()
+    没有这一项，takeScreenshot 会回调 onFailure(ERROR_TAKE_SCREENSHOT_...)。
+
+    事件类型只订阅 typeWindowStateChanged：切到微信/QQ 时触发一次，
+    比 typeWindowContentChanged 安静得多（后者每次列表滚动都响）。
+-->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeWindowStateChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagDefault"
+    android:canTakeScreenshot="true"
+    android:description="@string/accessibility_description"
+    android:notificationTimeout="300" />
