@@ -1,6 +1,9 @@
 package com.chronocapsule
 
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
@@ -19,6 +22,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import com.chronocapsule.capture.ScreenWatcherService
@@ -35,6 +39,7 @@ import java.util.UUID
 class MainActivity : AppCompatActivity() {
 
     private lateinit var status: TextView
+    private lateinit var card: TextView
     private lateinit var preview: ImageView
     private lateinit var btnPick: Button
     private lateinit var btnDefault: Button
@@ -67,6 +72,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         status = findViewById(R.id.tvStatus)
+        card = findViewById(R.id.tvCard)
         preview = findViewById(R.id.ivPreview)
         btnPick = findViewById(R.id.btnPick)
         btnDefault = findViewById(R.id.btnDefault)
@@ -108,10 +114,25 @@ class MainActivity : AppCompatActivity() {
                     result.httpCode == -1 -> PendingUploads.enqueue(applicationContext, payload)
                     result.ok -> PendingUploads.drain(applicationContext)
                 }
+                // 手动上传也走完整链路：上传只是材料，建任务才有卡片
+                val cardText = if (result.ok && result.screenId != null) {
+                    CloudClient.analyzeScreen(
+                        screenIds = listOf(result.screenId),
+                        baseUrls = CloudConfig.baseUrls(this),
+                        timeoutMs = 60_000L
+                    )?.toDisplayText()
+                } else {
+                    null
+                }
                 runOnUiThread {
                     btnUpload.isEnabled = true
-                    val suffix = if (result.httpCode == -1) "（已缓存，联网后自动补传）" else ""
+                    val suffix = when {
+                        result.httpCode == -1 -> "（已缓存，联网后自动补传）"
+                        cardText != null -> "，云端卡片已生成"
+                        else -> ""
+                    }
                     Toast.makeText(this, result.message + suffix, Toast.LENGTH_LONG).show()
+                    if (cardText != null) showCard(cardText)
                 }
             }.start()
         }
@@ -143,6 +164,36 @@ class MainActivity : AppCompatActivity() {
                 Toast.makeText(this, result.message, Toast.LENGTH_LONG).show()
             }
         }.start()
+    }
+
+    /** 自动记录在后台拿到卡片后会发这条 App 内广播，界面开着就直接展示 */
+    private val cardReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            val text = intent?.getStringExtra(ScreenWatcherService.EXTRA_CARD_TEXT) ?: return
+            showCard(text)
+        }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        ContextCompat.registerReceiver(
+            this,
+            cardReceiver,
+            IntentFilter(ScreenWatcherService.ACTION_CARD_READY),
+            ContextCompat.RECEIVER_NOT_EXPORTED
+        )
+    }
+
+    override fun onStop() {
+        super.onStop()
+        unregisterReceiver(cardReceiver)
+    }
+
+    /** 把卡片标题 / 摘要 / 字段展开在状态区下面 */
+    private fun showCard(text: String) {
+        Log.i("ChronoUI", "显示云端卡片：${text.take(80)}")
+        card.text = text
+        card.visibility = android.view.View.VISIBLE
     }
 
     override fun onPause() {

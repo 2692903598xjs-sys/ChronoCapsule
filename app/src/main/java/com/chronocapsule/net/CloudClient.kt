@@ -52,6 +52,36 @@ object CloudClient {
 
     data class PingResult(val ok: Boolean, val message: String)
 
+    /** 云端返回的卡片（Cloud Agent 的 Card 模型） */
+    data class CardField(val label: String, val value: String)
+
+    data class TaskCard(
+        val taskId: String,
+        val status: String,
+        val title: String,
+        val summary: String,
+        val fields: List<CardField>,
+        val revision: Int
+    ) {
+        /** 给界面 / 日志用的一行一文展示 */
+        fun toDisplayText(): String = buildString {
+            append("云端卡片：").append(title)
+            if (summary.isNotBlank()) append('\n').append(summary)
+            for (field in fields) {
+                append('\n').append("• ").append(field.label).append('：').append(field.value)
+            }
+        }
+    }
+
+    data class TaskResult(
+        val ok: Boolean,
+        val httpCode: Int,
+        val taskId: String?,
+        val replayed: Boolean,
+        val message: String,
+        val baseUrl: String? = null
+    )
+
     /**
      * 测试连接：GET /api/screens（云端已有的列表接口）。
      *
@@ -171,6 +201,207 @@ object CloudClient {
         } finally {
             conn?.disconnect()
         }
+    }
+
+    // ─────────────────────── 建任务 → 取卡片 ───────────────────────
+    //
+    // 云端只把上传的屏当"材料"存着，要出卡片必须再建一个任务：
+    //   POST /api/tasks {event_id, instruction, screen_ids[]}
+    //   GET  /api/tasks/{tid}  →  status=queued/running/waiting_input，卡片在 card 字段
+    // 用固定的 event_id（task-<screen_id>）做幂等：同屏重复建任务只返回同一个。
+
+    /** 建任务时给云端 Super-Agent 的指令，端侧固定这一句 */
+    const val DEFAULT_TASK_INSTRUCTION =
+        "整理这一屏聊天里提到的时间、地点、待办和需要我回复的事项。"
+
+    private const val TASK_POLL_INTERVAL_MS = 1_500L
+    private const val TASK_POLL_TIMEOUT_MS = 90_000L
+
+    private data class TaskState(val status: String, val card: TaskCard?)
+
+    /**
+     * 上传一屏之后调用：建任务并等云端产出卡片。必须在后台线程调用（会阻塞）。
+     *
+     * @return 云端卡片；建任务失败、云端报错或超时返回 null（不影响已上传的屏）
+     */
+    fun analyzeScreen(
+        screenIds: List<String>,
+        baseUrls: List<String> = DEFAULT_BASE_URLS,
+        apiKey: String? = null,
+        timeoutMs: Long = TASK_POLL_TIMEOUT_MS
+    ): TaskCard? {
+        if (screenIds.isEmpty()) return null
+        val eventId = "task-${screenIds.first()}"
+
+        val created = createTask(eventId, screenIds, DEFAULT_TASK_INSTRUCTION, baseUrls, apiKey)
+        Log.i(TAG, "建任务：${created.message}")
+        val taskId = created.taskId ?: return null
+        val baseUrl = created.baseUrl ?: return null
+
+        val deadline = System.currentTimeMillis() + timeoutMs
+        var waitingLogged = false
+        while (System.currentTimeMillis() < deadline) {
+            val state = getTask(baseUrl, taskId, apiKey)
+            if (state == null) {
+                // 网络抖一下就再试一次，别把任务丢了
+                Thread.sleep(TASK_POLL_INTERVAL_MS)
+                continue
+            }
+            state.card?.let {
+                Log.i(TAG, "任务 $taskId 产出卡片：${it.title}（${it.fields.size} 个字段）")
+                return it
+            }
+            when (state.status) {
+                "failed", "cancelled" -> {
+                    Log.w(TAG, "任务 $taskId 状态 ${state.status}，没有卡片")
+                    return null
+                }
+                "running" -> if (!waitingLogged) {
+                    Log.i(TAG, "任务 $taskId 已开始处理…")
+                    waitingLogged = true
+                }
+            }
+            Thread.sleep(TASK_POLL_INTERVAL_MS)
+        }
+        Log.w(TAG, "任务 $taskId 等待卡片超时（${timeoutMs}ms）")
+        return null
+    }
+
+    /** POST /api/tasks，成功返回 202 + {"task":{...},"replayed":false} */
+    fun createTask(
+        eventId: String,
+        screenIds: List<String>,
+        instruction: String = DEFAULT_TASK_INSTRUCTION,
+        baseUrls: List<String> = DEFAULT_BASE_URLS,
+        apiKey: String? = null
+    ): TaskResult {
+        var last: TaskResult? = null
+        for (baseUrl in baseUrls) {
+            val result = createTaskOnce(eventId, screenIds, instruction, baseUrl, apiKey)
+            if (result.ok || result.httpCode != -1) return result
+            last = result
+        }
+        return last ?: TaskResult(false, -1, null, false, "没有可用的云端地址")
+    }
+
+    private fun createTaskOnce(
+        eventId: String,
+        screenIds: List<String>,
+        instruction: String,
+        baseUrl: String,
+        apiKey: String?
+    ): TaskResult {
+        val url = URL("${baseUrl.trimEnd('/')}/api/tasks")
+        val body = JSONObject().apply {
+            put("event_id", eventId)
+            put("instruction", instruction)
+            put("screen_ids", org.json.JSONArray(screenIds))
+            put("interaction_protocol", "legacy")
+        }.toString().toByteArray(StandardCharsets.UTF_8)
+
+        var conn: HttpURLConnection? = null
+        return try {
+            conn = (URL(url.toString()).openConnection() as HttpURLConnection).apply {
+                requestMethod = "POST"
+                doOutput = true
+                connectTimeout = CONNECT_TIMEOUT_MS
+                readTimeout = READ_TIMEOUT_MS
+                setRequestProperty("Content-Type", "application/json; charset=utf-8")
+                setRequestProperty("Accept", "application/json")
+                if (!apiKey.isNullOrBlank()) {
+                    setRequestProperty("Authorization", "Bearer $apiKey")
+                }
+                setFixedLengthStreamingMode(body.size)
+            }
+            conn.outputStream.use { it.write(body) }
+
+            val code = conn.responseCode
+            val text = readBody(conn, code)
+            Log.i(TAG, "POST $url → $code, ${text.take(300)}")
+
+            if (code in 200..299) {
+                val json = runCatching { JSONObject(text) }.getOrNull()
+                val task = json?.optJSONObject("task")
+                val taskId = task?.optString("id")?.takeIf { it.isNotEmpty() }
+                TaskResult(
+                    ok = true,
+                    httpCode = code,
+                    taskId = taskId,
+                    replayed = json?.optBoolean("replayed", false) ?: false,
+                    message = "任务已提交 task_id=$taskId（状态 ${task?.optString("status")}）",
+                    baseUrl = baseUrl
+                )
+            } else {
+                TaskResult(false, code, null, false, "建任务失败 HTTP $code：${text.take(200)}")
+            }
+        } catch (e: IOException) {
+            Log.e(TAG, "建任务失败", e)
+            TaskResult(false, -1, null, false, "${e.javaClass.simpleName}: ${e.message}")
+        } finally {
+            conn?.disconnect()
+        }
+    }
+
+    /** GET /api/tasks/{tid}，取不到返回 null（交给调用方重试） */
+    private fun getTask(baseUrl: String, taskId: String, apiKey: String?): TaskState? {
+        val url = "${baseUrl.trimEnd('/')}/api/tasks/$taskId"
+        var conn: HttpURLConnection? = null
+        return try {
+            conn = (URL(url).openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = CONNECT_TIMEOUT_MS
+                readTimeout = READ_TIMEOUT_MS
+                setRequestProperty("Accept", "application/json")
+                if (!apiKey.isNullOrBlank()) {
+                    setRequestProperty("Authorization", "Bearer $apiKey")
+                }
+            }
+            val code = conn.responseCode
+            val text = readBody(conn, code)
+            if (code !in 200..299) {
+                Log.w(TAG, "GET $url → $code, ${text.take(200)}")
+                return null
+            }
+            val task = runCatching { JSONObject(text).optJSONObject("task") }.getOrNull() ?: return null
+            val status = task.optString("status")
+            val cardJson = task.optJSONObject("card")
+            val card = cardJson?.let {
+                parseCard(taskId, status, it, task.optInt("card_revision", 0))
+            }
+            TaskState(status, card)
+        } catch (e: IOException) {
+            Log.w(TAG, "取任务失败：${e.javaClass.simpleName}: ${e.message}")
+            null
+        } finally {
+            conn?.disconnect()
+        }
+    }
+
+    private fun parseCard(
+        taskId: String,
+        status: String,
+        card: JSONObject,
+        revision: Int
+    ): TaskCard {
+        val fields = mutableListOf<CardField>()
+        val array = card.optJSONArray("fields")
+        if (array != null) {
+            for (i in 0 until array.length()) {
+                val field = array.optJSONObject(i) ?: continue
+                fields += CardField(
+                    label = field.optString("label"),
+                    value = field.optString("value")
+                )
+            }
+        }
+        return TaskCard(
+            taskId = taskId,
+            status = status,
+            title = card.optString("title"),
+            summary = card.optString("summary"),
+            fields = fields,
+            revision = revision
+        )
     }
 
     private fun readBody(conn: HttpURLConnection, code: Int): String {

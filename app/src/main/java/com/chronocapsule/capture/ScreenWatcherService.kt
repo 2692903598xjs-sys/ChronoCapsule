@@ -2,6 +2,7 @@ package com.chronocapsule.capture
 
 import android.accessibilityservice.AccessibilityService
 import android.app.KeyguardManager
+import android.content.Intent
 import android.graphics.Bitmap
 import android.os.Handler
 import android.os.Looper
@@ -49,6 +50,10 @@ class ScreenWatcherService : AccessibilityService() {
     /** 一张图还没处理完就不再抓新的 */
     @Volatile
     private var busy = false
+
+    /** 已经有一个任务在等云端卡片，别为下一屏再建任务（云端本来就是串行处理） */
+    @Volatile
+    private var taskInFlight = false
 
     /** 每次开始抓图的时刻，看门狗用来判断 busy 卡了多久 */
     @Volatile
@@ -251,7 +256,11 @@ class ScreenWatcherService : AccessibilityService() {
                 // 网络不可达：落盘，等下次连上再补
                 result.httpCode == -1 -> PendingUploads.enqueue(applicationContext, toUpload)
                 // 上传成功说明网络恢复了，顺手把之前积压的补传掉
-                result.ok -> PendingUploads.drain(applicationContext)
+                result.ok -> {
+                    PendingUploads.drain(applicationContext)
+                    // 屏只是原料，再建任务云端才会产出卡片；放后台线程，不拖慢下一屏
+                    submitTask(result.screenId)
+                }
             }
         } catch (t: Throwable) {
             Log.e(TAG, "自动处理失败", t)
@@ -268,6 +277,40 @@ class ScreenWatcherService : AccessibilityService() {
         }
     }
 
+    /**
+     * 上传成功后在后台建任务、等卡片。
+     *
+     * 同一时间只跑一个：云端任务本来就排队处理，端侧堆多个线程只会重复等。
+     * 卡片拿到后发 App 内广播，界面开着就能直接看到。
+     */
+    private fun submitTask(screenId: String?) {
+        if (screenId == null) return
+        if (taskInFlight) {
+            Log.i(TAG, "上一个任务还在等卡片，本屏不重复建任务")
+            return
+        }
+        taskInFlight = true
+        Thread {
+            try {
+                val card = CloudClient.analyzeScreen(
+                    screenIds = listOf(screenId),
+                    baseUrls = CloudConfig.baseUrls(applicationContext)
+                ) ?: return@Thread
+                Log.i("ChronoCard", card.toDisplayText())
+                sendBroadcast(
+                    Intent(ACTION_CARD_READY)
+                        .setPackage(packageName)
+                        .putExtra(EXTRA_CARD_TEXT, card.toDisplayText())
+                        .putExtra(EXTRA_CARD_TASK, card.taskId)
+                )
+            } catch (t: Throwable) {
+                Log.e(TAG, "建任务或取卡片失败", t)
+            } finally {
+                taskInFlight = false
+            }
+        }.start()
+    }
+
     override fun onInterrupt() {
         Log.w(TAG, "无障碍服务被中断")
     }
@@ -280,6 +323,11 @@ class ScreenWatcherService : AccessibilityService() {
 
     companion object {
         private const val TAG = "ScreenWatcher"
+
+        /** 云端卡片产出后发给界面的 App 内广播（只发给本应用） */
+        const val ACTION_CARD_READY = "com.chronocapsule.CARD_READY"
+        const val EXTRA_CARD_TEXT = "card_text"
+        const val EXTRA_CARD_TASK = "card_task_id"
 
         /** 只在这些应用里自动记录。加新应用只需要往这张表里加一行 */
         private val CHAT_PACKAGES = mapOf(
