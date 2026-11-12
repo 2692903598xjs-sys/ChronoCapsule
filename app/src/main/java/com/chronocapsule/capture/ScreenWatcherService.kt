@@ -17,6 +17,7 @@ import com.chronocapsule.net.CloudClient
 import com.chronocapsule.net.CloudConfig
 import com.chronocapsule.net.PendingUploads
 import com.chronocapsule.pipeline.ScreenPipeline
+import com.chronocapsule.util.EventTrace
 import java.io.File
 import java.util.UUID
 
@@ -78,7 +79,7 @@ class ScreenWatcherService : AccessibilityService() {
 
     override fun onServiceConnected() {
         super.onServiceConnected()
-        Log.i(TAG, "无障碍服务已连接，开始监听聊天应用")
+        EventTrace.log(applicationContext, TAG, "无障碍服务已连接，开始监听聊天应用")
 
         // 读历史、补传离线队列都要碰磁盘和网络，别占主线程
         Thread {
@@ -89,22 +90,39 @@ class ScreenWatcherService : AccessibilityService() {
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         val e = event ?: return
-        if (e.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
-
         val rawPkg = e.packageName?.toString() ?: return
         val className = e.className?.toString().orEmpty()
-        Log.d(TAG, "窗口事件：$rawPkg / $className")
+        // 真机上 logcat 常常读不到，先落盘再判断，才能看到事件到底有没有来
+        EventTrace.log(applicationContext, TAG, "事件 type=${e.eventType} $rawPkg / $className")
+
+        if (e.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
 
         // 只认聊天 App 自己的窗口事件。输入法弹出时事件包名是输入法，
         // 拿"最近一次聊天 App"去猜键盘底下是谁，实测会把键盘按键当成聊天内容
         // 传上云（整屏 36 条里 35 条是 Gboard 的键），比漏一屏更糟。
         val appName = CHAT_PACKAGES[rawPkg] ?: return
+        if (!isChatWindow(className)) {
+            EventTrace.log(applicationContext, TAG, "非聊天页面，跳过：$className")
+            return
+        }
+        EventTrace.log(applicationContext, TAG, "命中聊天窗口：$appName / $className")
 
         // 不立刻抓：等动画结束、页面渲染完再抓，否则经常截到空白会话页
         pendingPkg = rawPkg
         pendingAppName = appName
         handler.removeCallbacks(pendingCapture)
         handler.postDelayed(pendingCapture, SETTLE_MS)
+    }
+
+    /**
+     * 同一个 App 里不全是聊天：微信的网页、图片查看器，QQ 的相册/空间/支付页
+     * 都会发同样的窗口事件。这些页面抓下来会把网页内容当成聊天消息上传，
+     * 真机实测一屏相册能出 60 个垃圾块。按类名挡掉，宁可少抓一屏。
+     */
+    private fun isChatWindow(className: String): Boolean {
+        if (className.isEmpty()) return true
+        val lower = className.lowercase()
+        return BLOCKED_WINDOW_CLASSES.none { lower.contains(it) }
     }
 
     /** 界面已稳定，真正执行截图前的最后一轮检查 */
@@ -116,14 +134,14 @@ class ScreenWatcherService : AccessibilityService() {
         if (busy) {
             // 上一张还在流水线里。不要丢：pending 还留着，process 结束时会补抓
             if (now - busySince < BUSY_TIMEOUT_MS) {
-                Log.d(TAG, "上一张还在处理，稍后补抓")
+                EventTrace.log(applicationContext, TAG, "上一张还在处理，稍后补抓")
                 return
             }
-            Log.w(TAG, "上一张处理超过 ${BUSY_TIMEOUT_MS / 1000} 秒未结束，强制复位")
+            EventTrace.log(applicationContext, TAG, "上一张处理超过 ${BUSY_TIMEOUT_MS / 1000} 秒未结束，强制复位")
             busy = false
         }
         if (!screenReady()) {
-            Log.d(TAG, "息屏或锁屏，跳过")
+            EventTrace.log(applicationContext, TAG, "息屏或锁屏，跳过")
             clearPending()
             return
         }
@@ -140,6 +158,7 @@ class ScreenWatcherService : AccessibilityService() {
 
         clearPending()
         lastCaptureAt = now
+        EventTrace.log(applicationContext, TAG, "开始截图：$appName")
         capture(pkg, appName)
     }
 
@@ -185,16 +204,17 @@ class ScreenWatcherService : AccessibilityService() {
                     buffer.close()
 
                     if (software == null) {
-                        Log.w(TAG, "截图转换失败")
+                        EventTrace.log(applicationContext, TAG, "截图转换失败")
                         busy = false
                         return
                     }
+                    EventTrace.log(applicationContext, TAG, "截图成功 ${software.width}×${software.height}")
                     Thread { process(software, pkg, appName) }.start()
                 }
 
                 override fun onFailure(errorCode: Int) {
                     // 1 = 服务没被授予截图能力；2 = 被系统限流
-                    Log.w(TAG, "截图失败 code=$errorCode")
+                    EventTrace.log(applicationContext, TAG, "截图失败 code=$errorCode")
                     busy = false
                 }
             }
@@ -218,8 +238,13 @@ class ScreenWatcherService : AccessibilityService() {
             )
             Log.i("ChronoPayload", output.payload.toJsonString())
 
+            EventTrace.log(
+                applicationContext, TAG,
+                "OCR ${output.lines.size} 行，消息 ${output.structured.messages.size} 条，耗时 ${output.timing.endToEnd}ms"
+            )
+
             if (output.payload.blocks.isEmpty()) {
-                Log.i(TAG, "没有识别出文字，跳过上传")
+                EventTrace.log(applicationContext, TAG, "没有识别出文字，跳过上传")
                 return
             }
 
@@ -230,7 +255,7 @@ class ScreenWatcherService : AccessibilityService() {
                 pageTitle = output.payload.pageTitle
             )
             if (deduped.blocks.isEmpty()) {
-                Log.i(TAG, "没有新消息（整屏 ${output.payload.blocks.size} 条都已上传过），跳过上传")
+                EventTrace.log(applicationContext, TAG, "没有新消息（整屏 ${output.payload.blocks.size} 条都已上传过），跳过上传")
                 return
             }
             if (deduped.skipped > 0) {
@@ -250,7 +275,7 @@ class ScreenWatcherService : AccessibilityService() {
                 toUpload,
                 CloudConfig.baseUrls(applicationContext)
             )
-            Log.i(TAG, "自动上传：${result.message}")
+            EventTrace.log(applicationContext, TAG, "自动上传：${result.message}")
 
             when {
                 // 网络不可达：落盘，等下次连上再补
@@ -286,7 +311,7 @@ class ScreenWatcherService : AccessibilityService() {
     private fun submitTask(screenId: String?) {
         if (screenId == null) return
         if (taskInFlight) {
-            Log.i(TAG, "上一个任务还在等卡片，本屏不重复建任务")
+            EventTrace.log(applicationContext, TAG, "上一个任务还在等卡片，本屏不重复建任务")
             return
         }
         taskInFlight = true
@@ -296,7 +321,12 @@ class ScreenWatcherService : AccessibilityService() {
                     screenIds = listOf(screenId),
                     baseUrls = CloudConfig.baseUrls(applicationContext)
                 ) ?: return@Thread
+                // 落盘只记任务和字段数，聊天原文不进本地日志（Logcat 里仍可看到全文）
                 Log.i("ChronoCard", card.toDisplayText())
+                EventTrace.log(
+                    applicationContext, "ChronoCard",
+                    "${card.taskId}「${card.title}」${card.fields.size} 个字段"
+                )
                 sendBroadcast(
                     Intent(ACTION_CARD_READY)
                         .setPackage(packageName)
@@ -337,6 +367,18 @@ class ScreenWatcherService : AccessibilityService() {
 
         /** 窗口事件后等这么久再抓，避开切换动画，保证拿到渲染完的页面 */
         private const val SETTLE_MS = 350L
+
+        /**
+         * 类名里带这些片段的窗口不是聊天页：
+         * webview 网页、gallery 图片查看、相册、系统对话框、QQ 空间/插件页。
+         * 小写比较，微信/QQ 的类名大小写不统一。
+         */
+        private val BLOCKED_WINDOW_CLASSES = listOf(
+            "webview", "gallery", "winkhome", "qbasealbum",
+            "dialog", "imageviewer", "browser",
+            // 公众号文章是 Flutter 页面，类名里没有 webview
+            "brandservice", "flutter", "plugin."
+        )
 
         /**
          * 两次采集的最小间隔。系统建屏硬限 1 秒 1 张，这里留 1.5 倍余量；

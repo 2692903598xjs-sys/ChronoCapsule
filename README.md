@@ -4,7 +4,7 @@ Android 端侧屏幕感知模块：**无障碍自动抓屏 → 端侧 OCR → �
 
 整条流水线在本机完成，云端只接收结构化文本，不上传截图。
 
-```
+```text
 聊天窗口切换
    │  AccessibilityService（无需每次授权，抓不到 FLAG_SECURE 页面）
    ▼
@@ -69,7 +69,7 @@ JAVA_HOME="D:/Android/Android Studio/jbr" ./gradlew.bat --offline testDebugUnitT
 
 ## 目录结构
 
-```
+```text
 app/src/main/java/com/chronocapsule/
 ├── MainActivity.kt              手动上传、自动记录开关、云端地址
 ├── capture/ScreenWatcherService.kt   自动抓屏与调度
@@ -90,6 +90,7 @@ app/src/main/assets/models/      OCR 模型与字典
 
 - 真机微信 / QQ 尚未实测（模拟器上用系统短信 App 验证了同一条代码路径）。
 - 只在窗口切换时采集；停留在同一会话期间的新消息等下一次切换才记录。
+- 只抓聊天页：微信的网页 / 图片查看器 / 公众号文章、QQ 的相册 / 空间 / 支付页会按类名跳过。
 - 输入法弹出时的事件包名为输入法，不做兜底采集（会把键盘按键当聊天内容）。
 - 跨零点消息的时间会被记到前一天。
 
